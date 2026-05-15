@@ -153,6 +153,67 @@ func TestGenericCLIRunnerAdapterUsesLastStructuredReviewVerdictInReviewMode(t *t
 	}
 }
 
+func TestGenericCLIRunnerAdapterExtractsVerdictFromJSONLAgentMessage(t *testing.T) {
+	t.Helper()
+	runner := commandRunnerFunc(func(_ context.Context, spec CommandSpec) error {
+		event := `{"type":"item.completed","item":{"id":"item_0","type":"agent_message",` +
+			`"text":"REVIEW_VERDICT: pass"}}` + "\n"
+		_, err := io.WriteString(spec.Stdout, event)
+		return err
+	})
+	adapter := NewGenericCLIRunnerAdapter("codex-cli", "mock", []string{"exec"}, runner)
+
+	result, err := adapter.Run(context.Background(), contracts.RunnerRequest{
+		Model:    "openai/gpt-5.3-codex",
+		Mode:     contracts.RunnerModeReview,
+		TaskID:   "task-jsonl",
+		RepoRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if got := strings.TrimSpace(result.Artifacts["review_verdict"]); got != "pass" {
+		t.Fatalf("expected verdict from JSONL agent_message, got %q", got)
+	}
+	if !result.ReviewReady {
+		t.Fatalf("expected review_ready true for JSONL pass verdict")
+	}
+}
+
+func TestGenericCLIRunnerAdapterPrefersSubstantiveVerdictOverBareEcho(t *testing.T) {
+	t.Helper()
+	runner := commandRunnerFunc(func(_ context.Context, spec CommandSpec) error {
+		substantive := `{"type":"item.completed","item":{"type":"agent_message",` +
+			`"text":"Implementation satisfies all acceptance criteria; ` +
+			`integration tests cover idempotency and failure-preserve paths.\n` +
+			`REVIEW_VERDICT: pass"}}` + "\n"
+		bareEcho := `{"type":"item.completed","item":{"type":"agent_message",` +
+			`"text":"REVIEW_VERDICT: fail"}}` + "\n"
+		if _, err := io.WriteString(spec.Stdout, substantive); err != nil {
+			return err
+		}
+		_, err := io.WriteString(spec.Stdout, bareEcho)
+		return err
+	})
+	adapter := NewGenericCLIRunnerAdapter("codex-cli", "mock", []string{"exec"}, runner)
+
+	result, err := adapter.Run(context.Background(), contracts.RunnerRequest{
+		Model:    "openai/gpt-5.3-codex",
+		Mode:     contracts.RunnerModeReview,
+		TaskID:   "task-flipflop",
+		RepoRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if got := strings.TrimSpace(result.Artifacts["review_verdict"]); got != "pass" {
+		t.Fatalf("expected substantive pass to win over bare fail echo, got %q", got)
+	}
+	if !result.ReviewReady {
+		t.Fatalf("expected review_ready true when substantive verdict is pass")
+	}
+}
+
 func TestGenericCLIRunnerAdapterLeavesReviewFieldsUnsetOutsideReviewMode(t *testing.T) {
 	t.Helper()
 	runner := commandRunnerFunc(func(_ context.Context, spec CommandSpec) error {

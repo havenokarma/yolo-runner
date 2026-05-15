@@ -2,6 +2,7 @@ package codingagents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -305,20 +306,86 @@ func structuredReviewVerdict(logPath string) (string, bool) {
 	if normalized == "" {
 		return "", false
 	}
-	lastVerdict := ""
-	found := false
+	type verdictSample struct {
+		verdict     string
+		substantive bool
+	}
+	var samples []verdictSample
+	recordVerdict := func(sourceText string) {
+		verdict := ""
+		for _, sub := range strings.Split(sourceText, "\n") {
+			matches := structuredReviewVerdictLinePattern.FindStringSubmatch(sub)
+			if len(matches) < 2 {
+				continue
+			}
+			verdict = strings.ToLower(matches[1])
+		}
+		if verdict == "" {
+			return
+		}
+		cleaned := strings.TrimSpace(
+			structuredReviewVerdictLinePattern.ReplaceAllString(sourceText, ""),
+		)
+		samples = append(samples, verdictSample{
+			verdict:     verdict,
+			substantive: len(cleaned) >= 40,
+		})
+	}
 	for _, line := range strings.Split(normalized, "\n") {
-		matches := structuredReviewVerdictLinePattern.FindStringSubmatch(line)
-		if len(matches) < 2 {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
 			continue
 		}
-		lastVerdict = strings.ToLower(matches[1])
-		found = true
+		if structuredReviewVerdictLinePattern.MatchString(trimmed) {
+			recordVerdict(trimmed)
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "{") {
+			continue
+		}
+		if text := agentMessageTextFromJSONLine(trimmed); text != "" {
+			recordVerdict(text)
+		}
 	}
-	if !found {
+	if len(samples) == 0 {
 		return "", false
 	}
-	return lastVerdict, true
+	// Prefer the latest substantive verdict (one that came with reasoning
+	// text). This rejects standalone bare verdict echoes that some agents
+	// emit as a follow-up to a prior reasoned review.
+	chosen := samples[len(samples)-1].verdict
+	for i := len(samples) - 1; i >= 0; i-- {
+		if samples[i].substantive {
+			chosen = samples[i].verdict
+			break
+		}
+	}
+	return chosen, true
+}
+
+// agentMessageTextFromJSONLine extracts the user-visible text from a single
+// codex-cli / opencode-style JSONL stream event of shape
+//
+//	{"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+//
+// Returns the empty string for any other shape.
+func agentMessageTextFromJSONLine(line string) string {
+	var event map[string]any
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		return ""
+	}
+	if t, _ := event["type"].(string); t != "item.completed" {
+		return ""
+	}
+	item, ok := event["item"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if itemType, _ := item["type"].(string); itemType != "agent_message" {
+		return ""
+	}
+	text, _ := item["text"].(string)
+	return text
 }
 
 func resolveLogPath(request contracts.RunnerRequest, backend string) string {
