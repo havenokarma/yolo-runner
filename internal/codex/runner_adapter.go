@@ -809,14 +809,33 @@ func lastStructuredVerdictLine(text string) (string, bool) {
 	lastVerdict := ""
 	found := false
 	for _, line := range strings.Split(normalized, "\n") {
-		matches := structuredReviewVerdictLinePattern.FindStringSubmatch(line)
-		if len(matches) < 2 {
+		if verdict, ok := structuredReviewVerdictFromText(line); ok {
+			lastVerdict = verdict
+			found = true
 			continue
 		}
-		lastVerdict = strings.ToLower(matches[1])
-		found = true
+
+		var payload any
+		if err := json.Unmarshal([]byte(line), &payload); err != nil {
+			continue
+		}
+		if verdict, ok := structuredReviewVerdictFromText(extractText(payload)); ok {
+			lastVerdict = verdict
+			found = true
+		}
 	}
 	return lastVerdict, found
+}
+
+func structuredReviewVerdictFromText(text string) (string, bool) {
+	normalized := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(text)
+	for _, line := range strings.Split(normalized, "\n") {
+		matches := structuredReviewVerdictLinePattern.FindStringSubmatch(line)
+		if len(matches) >= 2 {
+			return strings.ToLower(matches[1]), true
+		}
+	}
+	return "", false
 }
 
 func lastStructuredReviewFailFeedbackLine(text string) (string, bool) {

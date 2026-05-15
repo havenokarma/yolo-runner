@@ -2817,6 +2817,39 @@ func TestCLIRunnerAdapterPreservesLogDerivedReviewReadyWhenCompletionHasNoVerdic
 	}
 }
 
+func TestCLIRunnerAdapterDerivesReviewReadyFromCodexExecJSONL(t *testing.T) {
+	repoRoot := t.TempDir()
+	adapter := NewCLIRunnerAdapter("codex-bin", commandRunnerFunc(func(_ context.Context, spec CommandSpec) error {
+		return json.NewEncoder(spec.Stdout).Encode(map[string]any{
+			"type": "item.completed",
+			"item": map[string]any{
+				"id":   "item-17",
+				"type": "agent_message",
+				"text": "REVIEW_VERDICT: pass",
+			},
+		})
+	}))
+
+	result, err := adapter.Run(context.Background(), contracts.RunnerRequest{
+		TaskID:   "t-review-codex-exec-jsonl",
+		RepoRoot: repoRoot,
+		Prompt:   "review",
+		Mode:     contracts.RunnerModeReview,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != contracts.RunnerResultCompleted {
+		t.Fatalf("expected completed status, got %s", result.Status)
+	}
+	if !result.ReviewReady {
+		t.Fatalf("expected ReviewReady=true from codex exec JSONL verdict")
+	}
+	if verdict := result.Artifacts["review_verdict"]; verdict != "pass" {
+		t.Fatalf("expected review_verdict=pass artifact, got %#v", result.Artifacts)
+	}
+}
+
 func TestCLIRunnerAdapterMapsTimeoutToBlocked(t *testing.T) {
 	adapter := NewCLIRunnerAdapter("codex-bin", commandRunnerFunc(func(_ context.Context, spec CommandSpec) error {
 		_, _ = io.WriteString(spec.Stdout, "still working\n")
