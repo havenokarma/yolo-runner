@@ -48,6 +48,18 @@ func TestBuildPromptReviewRequiresStructuredVerdict(t *testing.T) {
 	if !strings.Contains(prompt, "REVIEW_FAIL_FEEDBACK:") {
 		t.Fatalf("expected structured review fail feedback instructions, got %q", prompt)
 	}
+	if !strings.Contains(prompt, "REVIEW_FAIL_FEEDBACK must be ASCII-only English") {
+		t.Fatalf("expected ASCII-only feedback instruction, got %q", prompt)
+	}
+}
+
+func TestNormalizeReviewFeedbackTextRepairsLinearMojibake(t *testing.T) {
+	mojibake := "ÐÐµ Ð²ÑÐ¿Ð¾Ð»Ð½ÐµÐ½Ñ ÐºÐ»ÑÑÐµÐ²ÑÐµ AC: endpointâs parity missing"
+	got := normalizeReviewFeedbackText(mojibake)
+	want := "Не выполнены ключевые AC: endpoint’s parity missing"
+	if got != want {
+		t.Fatalf("expected repaired feedback %q, got %q", want, got)
+	}
 }
 
 func TestBuildPromptImplementExcludesReviewVerdictInstructions(t *testing.T) {
@@ -3024,6 +3036,18 @@ func TestLoopEmitsLogsUnderEpicTaskDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(expected); err != nil {
 		t.Fatalf("expected emitted log file %q, got err %v", expected, err)
+	}
+}
+
+func TestDefaultRunnerLogPathKeepsYoloCloneLogsOutsideClone(t *testing.T) {
+	repoRoot := filepath.Join("/work", "repo", ".yolo-runner", "clones", "task-1")
+	got := defaultRunnerLogPath(repoRoot, "task-1", "epic-1", "codex-cli")
+	want := filepath.Join("/work", "repo", ".yolo-runner", "logs", "task-runs", "epic-1", "task-1", "opencode", "task-1.jsonl")
+	if got != want {
+		t.Fatalf("expected yolo clone log path %q, got %q", want, got)
+	}
+	if strings.Contains(got, filepath.Join(".yolo-runner", "clones", "task-1", "runner-logs")) {
+		t.Fatalf("log path must not be inside task clone: %q", got)
 	}
 }
 

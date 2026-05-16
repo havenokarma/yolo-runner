@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/egv/yolo-runner/v2/internal/contracts"
 	"github.com/egv/yolo-runner/v2/internal/scheduler"
@@ -856,6 +857,7 @@ func (l *Loop) runTask(ctx context.Context, taskID string, workerID int, queuePo
 				if feedback == "" {
 					feedback = strings.TrimSpace(result.Reason)
 				}
+				feedback = normalizeReviewFeedbackText(feedback)
 				reviewRetryFeedback = feedback
 				if reviewRetries < l.options.MaxRetries {
 					reviewRetries++
@@ -1370,6 +1372,7 @@ func buildPrompt(task contracts.Task, mode contracts.RunnerMode, tddMode bool) s
 			"    REVIEW_VERDICT: fail",
 			"- If verdict is fail, the line immediately BEFORE the verdict MUST be exactly:",
 			"    REVIEW_FAIL_FEEDBACK: <one-line summary of blocking gaps and required fixes>",
+			"- REVIEW_FAIL_FEEDBACK must be ASCII-only English. Do not use non-ASCII characters in that line.",
 			"- Use pass only when implementation fully satisfies acceptance criteria AND tests pass.",
 			"- Do not include any other line that starts with REVIEW_VERDICT: or REVIEW_FAIL_FEEDBACK: anywhere in your reply.",
 			"- Example of a passing reply tail:",
@@ -1377,7 +1380,7 @@ func buildPrompt(task contracts.Task, mode contracts.RunnerMode, tddMode bool) s
 			"    REVIEW_VERDICT: pass",
 			"- Example of a failing reply tail:",
 			"    ...your analysis...",
-			"    REVIEW_FAIL_FEEDBACK: AC #4 not met — /metrics endpoint missing in cmd/foo/main.go",
+			"    REVIEW_FAIL_FEEDBACK: AC #4 not met: /metrics endpoint missing in cmd/foo/main.go",
 			"    REVIEW_VERDICT: fail",
 			"- If you omit the REVIEW_VERDICT line, the orchestrator will treat the run as fail and retry — print the verdict.",
 		}, "\n"))
@@ -2467,15 +2470,54 @@ func reviewRetryBlockersFromMetadata(metadata map[string]string) string {
 	}
 	for _, key := range []string{"review_fail_feedback", "review_feedback", "triage_reason"} {
 		if blocker := strings.TrimSpace(metadata[key]); blocker != "" {
-			return blocker
+			return normalizeReviewFeedbackText(blocker)
 		}
 	}
 	return ""
 }
 
+func normalizeReviewFeedbackText(feedback string) string {
+	feedback = strings.TrimSpace(feedback)
+	if feedback == "" || !looksLikeUTF8Mojibake(feedback) {
+		return feedback
+	}
+	repaired, ok := repairLatin1RenderedUTF8(feedback)
+	if !ok {
+		return feedback
+	}
+	repaired = strings.TrimSpace(repaired)
+	if repaired == "" || looksLikeUTF8Mojibake(repaired) {
+		return feedback
+	}
+	return repaired
+}
+
+func looksLikeUTF8Mojibake(s string) bool {
+	return strings.Contains(s, "Ð") ||
+		strings.Contains(s, "Ñ") ||
+		strings.Contains(s, "Â") ||
+		strings.Contains(s, "â") ||
+		strings.ContainsRune(s, '\u0080') ||
+		strings.ContainsRune(s, '\u0099')
+}
+
+func repairLatin1RenderedUTF8(s string) (string, bool) {
+	bytes := make([]byte, 0, len(s))
+	for _, r := range s {
+		if r > 0xff {
+			return "", false
+		}
+		bytes = append(bytes, byte(r))
+	}
+	if !utf8.Valid(bytes) {
+		return "", false
+	}
+	return string(bytes), true
+}
+
 func buildImplementPrompt(task contracts.Task, reviewFeedback string, reviewRetryCount int, completionFeedback string, completionRetryCount int, tddMode bool) string {
 	prompt := buildPrompt(task, contracts.RunnerModeImplement, tddMode)
-	feedback := strings.TrimSpace(reviewFeedback)
+	feedback := normalizeReviewFeedbackText(reviewFeedback)
 	if feedback != "" && reviewRetryCount > 0 {
 		prompt = strings.Join([]string{
 			prompt,
@@ -2687,7 +2729,7 @@ func defaultRunnerLogPath(repoRoot string, taskID string, epicID string, backend
 	if strings.TrimSpace(repoRoot) == "" || strings.TrimSpace(taskID) == "" {
 		return ""
 	}
-	parts := []string{repoRoot, "runner-logs"}
+	parts := []string{defaultRunnerLogRoot(repoRoot)}
 	if epicID = strings.TrimSpace(epicID); epicID != "" {
 		parts = append(parts, epicID)
 	}
@@ -2695,6 +2737,19 @@ func defaultRunnerLogPath(repoRoot string, taskID string, epicID string, backend
 	parts = append(parts, runnerLogBackendDir(backend))
 	parts = append(parts, taskID+".jsonl")
 	return filepath.Join(parts...)
+}
+
+func defaultRunnerLogRoot(repoRoot string) string {
+	clean := filepath.Clean(strings.TrimSpace(repoRoot))
+	if clean == "." || clean == "" {
+		return filepath.Join(repoRoot, "runner-logs")
+	}
+	marker := string(filepath.Separator) + filepath.Join(".yolo-runner", "clones") + string(filepath.Separator)
+	if idx := strings.Index(clean, marker); idx >= 0 {
+		yoloDir := clean[:idx+len(string(filepath.Separator)+".yolo-runner")]
+		return filepath.Join(yoloDir, "logs", "task-runs")
+	}
+	return filepath.Join(repoRoot, "runner-logs")
 }
 
 func ensureRunnerLogDirectory(repoRoot string, logPath string) error {

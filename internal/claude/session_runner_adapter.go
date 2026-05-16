@@ -97,6 +97,12 @@ func (a *SessionRunnerAdapter) Run(ctx context.Context, request contracts.Runner
 	if ts, ok := session.(*StdinTaskSession); ok {
 		logPath := ts.LogPath()
 		result.LogPath = logPath
+		if result.Status == contracts.RunnerResultCompleted {
+			if reason, ok := claudeProviderLimitReason(logPath, contracts.BackendLogSidecarPath(logPath, contracts.BackendLogStderr)); ok {
+				result.Status = contracts.RunnerResultFailed
+				result.Reason = reason
+			}
+		}
 		if result.Status == contracts.RunnerResultCompleted && request.Mode == contracts.RunnerModeReview {
 			result.ReviewReady = hasStructuredPassVerdict(logPath)
 		}

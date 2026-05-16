@@ -133,6 +133,12 @@ func (a *CLIRunnerAdapter) Run(ctx context.Context, request contracts.RunnerRequ
 	finishedAt := a.now().UTC()
 	result := contracts.NormalizeBackendRunnerResult(startedAt, finishedAt, request, runErr, nil)
 	result.LogPath = logPath
+	if result.Status == contracts.RunnerResultCompleted {
+		if reason, ok := claudeProviderLimitReason(logPath, stderrPath); ok {
+			result.Status = contracts.RunnerResultFailed
+			result.Reason = reason
+		}
+	}
 	// Flush before reading the JSONL for verdict/feedback extraction; without
 	// the explicit Sync the tail of the reviewer reply can still sit in the
 	// kernel buffer when buildRunnerArtifacts opens the file.
@@ -247,6 +253,32 @@ func buildRunnerArtifacts(request contracts.RunnerRequest, result contracts.Runn
 		}
 	}
 	return contracts.BuildRunnerArtifacts("claude", request, result, extras)
+}
+
+func claudeProviderLimitReason(paths ...string) (string, bool) {
+	for _, path := range paths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		text := strings.ToLower(string(content))
+		for _, needle := range []string{
+			"you've hit your limit",
+			"claude ai usage limit reached",
+			"usage limit reached",
+			"rate limit exceeded",
+			"too many requests",
+			"quota exceeded",
+			"credit balance is too low",
+			`"status":"rate_limited"`,
+			"ratelimittype",
+		} {
+			if strings.Contains(text, needle) {
+				return "claude provider limit: " + needle, true
+			}
+		}
+	}
+	return "", false
 }
 
 func hasStructuredPassVerdict(logPath string) bool {

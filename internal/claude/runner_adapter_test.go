@@ -230,3 +230,25 @@ func TestCLIRunnerAdapterMapsGenericErrorToFailed(t *testing.T) {
 		t.Fatalf("expected failure reason to contain claude failed, got %q", result.Reason)
 	}
 }
+
+func TestCLIRunnerAdapterMapsClaudeLimitTextToFailed(t *testing.T) {
+	adapter := NewCLIRunnerAdapter("claude-bin", commandRunnerFunc(func(_ context.Context, spec CommandSpec) error {
+		_, _ = io.WriteString(spec.Stdout, "You've hit your limit · resets 8:40pm (UTC)\n")
+		return nil
+	}))
+
+	result, err := adapter.Run(context.Background(), contracts.RunnerRequest{
+		TaskID:   "t-limit",
+		RepoRoot: t.TempDir(),
+		Prompt:   "implement",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != contracts.RunnerResultFailed {
+		t.Fatalf("expected failed status, got %s", result.Status)
+	}
+	if !strings.Contains(result.Reason, "claude provider limit") {
+		t.Fatalf("expected provider limit reason, got %q", result.Reason)
+	}
+}
