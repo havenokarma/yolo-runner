@@ -75,3 +75,46 @@ func TestStructuredReviewVerdict_IgnoresNonAgentMessageItems(t *testing.T) {
 		t.Fatalf("must not pick verdict from non-agent_message items")
 	}
 }
+
+// TestStructuredReviewFailFeedback_CodexCLIJSONL pins the feedback extractor
+// against real codex-cli reviewer output. Before this fix the generic command
+// adapter (used by codex-cli reviewer) extracted only the verdict and dropped
+// the structured feedback line, so retry implementers received the generic
+// "review verdict returned fail" instead of actionable blockers — exactly the
+// monotonic-decay loop observed on ENG-15 (7 review fails, no detailed
+// feedback ever made it to Linear).
+func TestStructuredReviewFailFeedback_CodexCLIJSONL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex-fail.jsonl")
+	content := `{"type":"thread.started","thread_id":"abc"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Long analysis text...\nREVIEW_FAIL_FEEDBACK: AC #2 not met: autoscale.Controller not wired in cmd/vpn-admin runtime\nREVIEW_VERDICT: fail"}}
+{"type":"turn.completed"}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	feedback, ok := structuredReviewFailFeedback(path)
+	if !ok {
+		t.Fatalf("feedback not extracted from JSONL agent_message")
+	}
+	want := "AC #2 not met: autoscale.Controller not wired in cmd/vpn-admin runtime"
+	if feedback != want {
+		t.Fatalf("feedback mismatch\n got: %q\nwant: %q", feedback, want)
+	}
+}
+
+// TestStructuredReviewFailFeedback_LastWins covers the case where the reviewer
+// emits an intermediate REVIEW_FEEDBACK draft and then a final
+// REVIEW_FAIL_FEEDBACK summary — we want the last one.
+func TestStructuredReviewFailFeedback_LastWins(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex-multi.jsonl")
+	content := `{"type":"item.completed","item":{"type":"agent_message","text":"REVIEW_FEEDBACK: draft thoughts\nREVIEW_FAIL_FEEDBACK: final blocker\nREVIEW_VERDICT: fail"}}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	feedback, ok := structuredReviewFailFeedback(path)
+	if !ok || feedback != "final blocker" {
+		t.Fatalf("expected final blocker, got %q ok=%v", feedback, ok)
+	}
+}

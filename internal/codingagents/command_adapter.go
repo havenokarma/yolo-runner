@@ -63,7 +63,10 @@ type GenericCLIRunnerAdapter struct {
 	now              func() time.Time
 }
 
-var structuredReviewVerdictLinePattern = regexp.MustCompile(`(?i)^\s*REVIEW_VERDICT\s*:\s*(pass|fail)(?:\s*DONE)?\s*$`)
+var (
+	structuredReviewVerdictLinePattern       = regexp.MustCompile(`(?i)^\s*REVIEW_VERDICT\s*:\s*(pass|fail)(?:\s*DONE)?\s*$`)
+	structuredReviewFailFeedbackLinePattern  = regexp.MustCompile(`(?i)^\s*REVIEW_(?:FAIL_)?FEEDBACK\s*:\s*(.+?)\s*$`)
+)
 
 func NewGenericCLIRunnerAdapter(backend string, binary string, args []string, runner CommandRunner) *GenericCLIRunnerAdapter {
 	if strings.TrimSpace(backend) == "" {
@@ -193,11 +196,21 @@ func (a *GenericCLIRunnerAdapter) Run(ctx context.Context, request contracts.Run
 	finishedAt := a.now().UTC()
 	result := contracts.NormalizeBackendRunnerResult(startedAt, finishedAt, request, runErr, nil)
 	result.LogPath = logPath
+	// Flush kernel buffers so the verdict/feedback extractor reads the full
+	// agent reply. Without Sync() the tail of the JSONL can still be in
+	// memory when os.ReadFile opens the file below; defer-Close runs only
+	// after this function returns.
+	_ = stdoutFile.Sync()
 	extras := map[string]string{}
 	if request.Mode == contracts.RunnerModeReview {
 		if verdict, ok := structuredReviewVerdict(logPath); ok {
 			extras["review_verdict"] = verdict
 			result.ReviewReady = strings.EqualFold(verdict, "pass")
+			if strings.EqualFold(verdict, "fail") {
+				if feedback, ok := structuredReviewFailFeedback(logPath); ok {
+					extras["review_fail_feedback"] = feedback
+				}
+			}
 		}
 	}
 	result.Artifacts = contracts.BuildRunnerArtifacts(a.backend, request, result, extras)
@@ -357,6 +370,34 @@ func structuredReviewVerdict(logPath string) (string, bool) {
 		return "", false
 	}
 	return lastVerdict, true
+}
+
+func structuredReviewFailFeedback(logPath string) (string, bool) {
+	if strings.TrimSpace(logPath) == "" {
+		return "", false
+	}
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		return "", false
+	}
+	lastFeedback := ""
+	found := false
+	for _, line := range extractStructuredCandidateLines(string(content)) {
+		matches := structuredReviewFailFeedbackLinePattern.FindStringSubmatch(line)
+		if len(matches) < 2 {
+			continue
+		}
+		candidate := strings.Join(strings.Fields(matches[1]), " ")
+		if candidate == "" {
+			continue
+		}
+		lastFeedback = candidate
+		found = true
+	}
+	if !found {
+		return "", false
+	}
+	return lastFeedback, true
 }
 
 func resolveLogPath(request contracts.RunnerRequest, backend string) string {
