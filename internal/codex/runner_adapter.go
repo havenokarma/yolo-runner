@@ -142,6 +142,11 @@ func (a *CLIRunnerAdapter) Run(ctx context.Context, request contracts.RunnerRequ
 	finishedAt := a.now().UTC()
 	result := contracts.NormalizeBackendRunnerResult(startedAt, finishedAt, request, runErr, nil)
 	result.LogPath = logPath
+	// Flush the codex JSONL to disk before we read it for verdict/feedback
+	// extraction; defer-Close runs only after this function returns, so without
+	// an explicit Sync the tail of the agent reply can still sit in the kernel
+	// buffer when buildRunnerArtifacts reads the file.
+	_ = stdoutFile.Sync()
 	ApplyAppServerCompletion(&result, completion)
 	hasCompletion := completion != nil
 	hasCompletionVerdict := completion != nil && completion.HasReviewVerdict

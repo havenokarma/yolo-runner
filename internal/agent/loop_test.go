@@ -221,6 +221,59 @@ func TestBuildImplementPromptIncludesReviewFeedbackWhenRetrying(t *testing.T) {
 	}
 }
 
+// TestReviewFeedbackPipelineEndToEnd guards the full cross-restart loop:
+// codex/claude adapter Artifacts -> SetTaskData metadata persisted in Linear
+// comments -> hydrated back into task.Metadata -> retry prompt. This protects
+// against regressions of either dyra found while debugging ENG-15.
+func TestReviewFeedbackPipelineEndToEnd(t *testing.T) {
+	// (1) Adapter populates Artifacts after extracting structured feedback.
+	result := contracts.RunnerResult{
+		Status: contracts.RunnerResultFailed,
+		Reason: "review rejected: AC2 autoscale.Controller not wired; AC3 burn-in test missing",
+		Artifacts: map[string]string{
+			"review_verdict":       "fail",
+			"review_fail_feedback": "AC2 autoscale.Controller not wired; AC3 burn-in test missing",
+		},
+	}
+
+	feedback := reviewFailFeedbackFromArtifacts(result)
+	if feedback != "AC2 autoscale.Controller not wired; AC3 burn-in test missing" {
+		t.Fatalf("artifact extraction lost feedback: %q", feedback)
+	}
+
+	// (2) Final-failed branch persists feedback into Linear via SetTaskData.
+	failedData := appendReviewOutcomeMetadata(map[string]string{}, result)
+	if got := failedData["review_fail_feedback"]; got != feedback {
+		t.Fatalf("appendReviewOutcomeMetadata dropped detailed feedback: %q", got)
+	}
+
+	// (3) Next pickup rehydrates metadata; reviewRetryBlockersFromMetadata
+	//     returns the actionable string (not the generic "review rejected").
+	rehydrated := map[string]string{
+		"review_fail_feedback": feedback,
+		"review_retry_count":   "2",
+	}
+	if blockers := reviewRetryBlockersFromMetadata(rehydrated); blockers != feedback {
+		t.Fatalf("rehydrated blockers should match feedback: got %q", blockers)
+	}
+
+	// (4) Prompt builder injects feedback into the implement attempt.
+	prompt := buildImplementPrompt(
+		contracts.Task{ID: "t-1", Title: "ENG-15", Description: "migrate write-path", Metadata: rehydrated},
+		reviewRetryBlockersFromMetadata(rehydrated),
+		2,
+		"",
+		0,
+		false,
+	)
+	if !strings.Contains(prompt, "REVIEW_FAIL_FEEDBACK:") {
+		t.Fatalf("prompt missing REVIEW_FAIL_FEEDBACK marker:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, feedback) {
+		t.Fatalf("prompt missing actionable feedback body:\n%s", prompt)
+	}
+}
+
 func TestLoopRetriesFailedImplementationWithCompletionAddendumThenSucceeds(t *testing.T) {
 	mgr := newFakeTaskManager(contracts.Task{ID: "t-1", Title: "Task 1", Status: contracts.TaskStatusOpen})
 	run := &fakeRunner{results: []contracts.RunnerResult{

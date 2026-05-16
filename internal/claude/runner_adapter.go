@@ -133,6 +133,10 @@ func (a *CLIRunnerAdapter) Run(ctx context.Context, request contracts.RunnerRequ
 	finishedAt := a.now().UTC()
 	result := contracts.NormalizeBackendRunnerResult(startedAt, finishedAt, request, runErr, nil)
 	result.LogPath = logPath
+	// Flush before reading the JSONL for verdict/feedback extraction; without
+	// the explicit Sync the tail of the reviewer reply can still sit in the
+	// kernel buffer when buildRunnerArtifacts opens the file.
+	_ = stdoutFile.Sync()
 	result.Artifacts = buildRunnerArtifacts(request, result)
 	if result.Status == contracts.RunnerResultCompleted && request.Mode == contracts.RunnerModeReview {
 		result.ReviewReady = hasStructuredPassVerdict(logPath)

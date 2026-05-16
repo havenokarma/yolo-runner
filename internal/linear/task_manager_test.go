@@ -394,6 +394,62 @@ func TestTaskManagerGetTaskMapsIssueDetailsAndDependencyMetadata(t *testing.T) {
 	}
 }
 
+func TestTaskManagerGetTaskRehydratesTaskDataFromComments(t *testing.T) {
+	t.Parallel()
+
+	manager := newLinearTestManager(t, func(t *testing.T, query string, w http.ResponseWriter) {
+		t.Helper()
+		if !strings.Contains(query, "ReadIssue") {
+			t.Fatalf("expected ReadIssue query, got %q", query)
+		}
+		if !strings.Contains(query, "comments(first: 100)") {
+			t.Fatalf("expected ReadIssue query to request comments, got %q", query)
+		}
+		_, _ = w.Write([]byte(`{
+  "data": {
+    "issue": {
+      "id": "iss-15",
+      "title": "Migrate write-path",
+      "description": "Body",
+      "state": {"type": "started", "name": "In Progress"},
+      "comments": {
+        "nodes": [
+          {"body": "review_retry_count=1", "createdAt": "2026-05-16T09:11:29Z"},
+          {"body": "review_feedback=stale earlier feedback", "createdAt": "2026-05-16T09:11:29Z"},
+          {"body": "decision=retry", "createdAt": "2026-05-16T11:05:11Z"},
+          {"body": "review_feedback=AC2 autoscale.Controller not wired; AC3 burn-in test missing", "createdAt": "2026-05-16T11:36:57Z"},
+          {"body": "review_retry_count=2", "createdAt": "2026-05-16T12:08:24Z"},
+          {"body": "completion_addendum=earlier completion failure", "createdAt": "2026-05-16T07:00:00Z"},
+          {"body": "freeform note without an equals sign", "createdAt": "2026-05-16T11:00:00Z"},
+          {"body": "irrelevant_key=should be ignored", "createdAt": "2026-05-16T11:00:00Z"}
+        ]
+      }
+    }
+  }
+}`))
+	})
+
+	task, err := manager.GetTask(context.Background(), "iss-15")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if got := task.Metadata["review_feedback"]; got != "AC2 autoscale.Controller not wired; AC3 burn-in test missing" {
+		t.Fatalf("expected last review_feedback to win, got %q", got)
+	}
+	if got := task.Metadata["review_retry_count"]; got != "2" {
+		t.Fatalf("expected review_retry_count=2, got %q", got)
+	}
+	if got := task.Metadata["completion_addendum"]; got != "earlier completion failure" {
+		t.Fatalf("expected completion_addendum carried over, got %q", got)
+	}
+	if _, ok := task.Metadata["irrelevant_key"]; ok {
+		t.Fatalf("expected irrelevant keys to be dropped, got %#v", task.Metadata)
+	}
+	if _, ok := task.Metadata["decision"]; ok {
+		t.Fatalf("expected non-allowlisted key 'decision' to be dropped, got %#v", task.Metadata)
+	}
+}
+
 func TestTaskManagerSetTaskStatusUpdatesIssueWorkflowState(t *testing.T) {
 	t.Parallel()
 

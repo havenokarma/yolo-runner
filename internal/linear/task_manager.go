@@ -74,6 +74,14 @@ type linearIssuePayload struct {
 	Children *struct {
 		Nodes []linearIssuePayload `json:"nodes"`
 	} `json:"children"`
+	Comments *struct {
+		Nodes []linearCommentPayload `json:"nodes"`
+	} `json:"comments"`
+}
+
+type linearCommentPayload struct {
+	Body      string `json:"body"`
+	CreatedAt string `json:"createdAt"`
 }
 
 type linearRelationPayload struct {
@@ -191,6 +199,9 @@ func (m *TaskManager) GetTask(ctx context.Context, taskID string) (contracts.Tas
 	if deps := blockedByIDs(issue.ID, relationNodes(issue)); len(deps) > 0 {
 		metadata["dependencies"] = strings.Join(deps, ",")
 	}
+	for key, value := range taskMetadataFromIssueComments(issue) {
+		metadata[key] = value
+	}
 	if len(metadata) == 0 {
 		metadata = nil
 	}
@@ -203,6 +214,65 @@ func (m *TaskManager) GetTask(ctx context.Context, taskID string) (contracts.Tas
 		ParentID:    parentID,
 		Metadata:    metadata,
 	}, nil
+}
+
+// taskDataMetadataKeys lists the keys persisted via SetTaskData (as
+// "key=value" Linear comments) that must be rehydrated back into
+// task.Metadata so the agent loop can read prior review/completion
+// remediation state after a restart.
+var taskDataMetadataKeys = map[string]struct{}{
+	"review_feedback":        {},
+	"review_fail_feedback":   {},
+	"review_retry_count":     {},
+	"completion_retry_count": {},
+	"completion_addendum":    {},
+	"triage_reason":          {},
+}
+
+func taskMetadataFromIssueComments(issue *linearIssuePayload) map[string]string {
+	if issue == nil || issue.Comments == nil || len(issue.Comments.Nodes) == 0 {
+		return nil
+	}
+	nodes := make([]linearCommentPayload, len(issue.Comments.Nodes))
+	copy(nodes, issue.Comments.Nodes)
+	sort.SliceStable(nodes, func(i, j int) bool {
+		return nodes[i].CreatedAt < nodes[j].CreatedAt
+	})
+	out := map[string]string{}
+	for _, node := range nodes {
+		key, value, ok := parseTaskDataComment(node.Body)
+		if !ok {
+			continue
+		}
+		if _, allowed := taskDataMetadataKeys[key]; !allowed {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func parseTaskDataComment(body string) (string, string, bool) {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return "", "", false
+	}
+	if idx := strings.IndexByte(trimmed, '\n'); idx >= 0 {
+		trimmed = trimmed[:idx]
+	}
+	eq := strings.IndexByte(trimmed, '=')
+	if eq <= 0 {
+		return "", "", false
+	}
+	key := strings.TrimSpace(trimmed[:eq])
+	if key == "" {
+		return "", "", false
+	}
+	value := strings.TrimRight(trimmed[eq+1:], " \t\r")
+	return key, value, true
 }
 
 func (m *TaskManager) GetTaskTree(ctx context.Context, rootID string) (*contracts.TaskTree, error) {
@@ -777,6 +847,12 @@ func (m *TaskManager) fetchIssue(ctx context.Context, issueID string) (*linearIs
       nodes {
         type
         relatedIssue { id }
+      }
+    }
+    comments(first: 100) {
+      nodes {
+        body
+        createdAt
       }
     }
   }
