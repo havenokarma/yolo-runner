@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3215,6 +3216,41 @@ func TestLoopEmitsRunnerProgressEventsFromRunnerCallback(t *testing.T) {
 	}
 	if startedEvents[0].Message != "cmd start" || outputEvents[0].Message != "line output" || finishedEvents[0].Message != "cmd finish" || warningEvents[0].Message != "stall warning" {
 		t.Fatalf("unexpected progress message mapping")
+	}
+}
+
+func TestLoopTruncatesHugeRunnerProgressEventMessages(t *testing.T) {
+	mgr := newFakeTaskManager(contracts.Task{ID: "t-1", Title: "Task 1", Status: contracts.TaskStatusOpen})
+	huge := strings.Repeat("x", maxRunnerProgressMessageBytes+2048)
+	run := &fakeRunner{
+		results:        []contracts.RunnerResult{{Status: contracts.RunnerResultCompleted}},
+		progressEvents: []contracts.RunnerProgress{{Type: "runner_output", Message: huge, Metadata: map[string]string{"source": "stdout"}}},
+	}
+	sink := &recordingSink{}
+	loop := NewLoop(mgr, run, sink, LoopOptions{ParentID: "root"})
+
+	_, err := loop.Run(context.Background())
+	if err != nil {
+		t.Fatalf("loop failed: %v", err)
+	}
+	outputEvents := eventsByType(sink.events, contracts.EventTypeRunnerOutput)
+	if len(outputEvents) != 1 {
+		t.Fatalf("expected one runner_output event, got %d", len(outputEvents))
+	}
+	if len(outputEvents[0].Message) >= len(huge) {
+		t.Fatalf("expected runner output to be truncated")
+	}
+	if !strings.Contains(outputEvents[0].Message, "[runner output truncated]") {
+		t.Fatalf("expected truncation marker, got %q", outputEvents[0].Message)
+	}
+	if outputEvents[0].Metadata["source"] != "stdout" {
+		t.Fatalf("expected existing metadata to be preserved, got %#v", outputEvents[0].Metadata)
+	}
+	if outputEvents[0].Metadata["truncated"] != "true" {
+		t.Fatalf("expected truncation metadata, got %#v", outputEvents[0].Metadata)
+	}
+	if outputEvents[0].Metadata["original_message_bytes"] != strconv.Itoa(len(huge)) {
+		t.Fatalf("expected original size metadata, got %#v", outputEvents[0].Metadata)
 	}
 }
 

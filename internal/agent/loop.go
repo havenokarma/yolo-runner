@@ -20,6 +20,7 @@ import (
 )
 
 const defaultQualityGateThreshold = 70
+const maxRunnerProgressMessageBytes = 16 * 1024
 
 const (
 	qualityGateToolTaskValidator     = "task_validator"
@@ -1146,6 +1147,7 @@ func (l *Loop) runWithRunner(ctx context.Context, runner contracts.AgentRunner, 
 		if eventTime.IsZero() {
 			eventTime = time.Now().UTC()
 		}
+		message, metadata := sanitizeRunnerProgressForEvent(progress.Message, progress.Metadata)
 		progressMu.Lock()
 		lastOutputAt = eventTime
 		warned = false
@@ -1157,8 +1159,8 @@ func (l *Loop) runWithRunner(ctx context.Context, runner contracts.AgentRunner, 
 			WorkerID:  worker,
 			ClonePath: clonePath,
 			QueuePos:  queuePos,
-			Message:   progress.Message,
-			Metadata:  progress.Metadata,
+			Message:   message,
+			Metadata:  metadata,
 			Timestamp: eventTime,
 		})
 	}
@@ -1213,6 +1215,27 @@ func (l *Loop) runWithRunner(ctx context.Context, runner contracts.AgentRunner, 
 	result, err := runner.Run(ctx, request)
 	cancel()
 	return result, err
+}
+
+func sanitizeRunnerProgressForEvent(message string, metadata map[string]string) (string, map[string]string) {
+	if len(message) <= maxRunnerProgressMessageBytes {
+		return message, metadata
+	}
+
+	truncated := message[:maxRunnerProgressMessageBytes]
+	for !utf8.ValidString(truncated) && len(truncated) > 0 {
+		truncated = truncated[:len(truncated)-1]
+	}
+	truncated += "\n... [runner output truncated]"
+
+	nextMetadata := cloneStringMap(metadata)
+	if nextMetadata == nil {
+		nextMetadata = map[string]string{}
+	}
+	nextMetadata["truncated"] = "true"
+	nextMetadata["original_message_bytes"] = strconv.Itoa(len(message))
+	nextMetadata["truncated_message_bytes"] = strconv.Itoa(len(truncated))
+	return truncated, nextMetadata
 }
 
 func (l *Loop) runLandingMergeConflictRemediation(ctx context.Context, task contracts.Task, taskVCS contracts.VCS, taskBranch string, worker string, taskRepoRoot string, queuePos int, mergeFailureReason string, runtime taskRuntimeConfig) contracts.RunnerResult {
