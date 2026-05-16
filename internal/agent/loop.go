@@ -56,37 +56,44 @@ type CloneManager interface {
 type VCSFactory func(repoRoot string) contracts.VCS
 
 type LoopOptions struct {
-	ParentID             string
-	MaxRetries           int
-	MaxTasks             int
-	Concurrency          int
-	SchedulerStatePath   string
-	DryRun               bool
-	Stop                 <-chan struct{}
-	RepoRoot             string
-	Backend              string
-	Model                string
-	FallbackModel        string
-	RunnerTimeout        time.Duration
-	WatchdogTimeout      time.Duration
-	WatchdogInterval     time.Duration
-	HeartbeatInterval    time.Duration
-	NoOutputWarningAfter time.Duration
-	TDDMode              bool
-	QualityGateThreshold int
-	QualityGateTools     []string
-	QCGateTools          []string
-	AllowLowQuality      bool
-	VCS                  contracts.VCS
-	RequireReview        bool
-	MergeOnSuccess       bool
-	CloneManager         CloneManager
-	VCSFactory           VCSFactory
+	ParentID              string
+	MaxRetries            int
+	MaxTasks              int
+	Concurrency           int
+	SchedulerStatePath    string
+	DryRun                bool
+	Stop                  <-chan struct{}
+	RepoRoot              string
+	Backend               string
+	Model                 string
+	FallbackBackend       string
+	FallbackModel         string
+	ReviewBackend         string
+	ReviewModel           string
+	ReviewFallbackBackend string
+	ReviewFallbackModel   string
+	BackendRunners        map[string]contracts.AgentRunner
+	RunnerTimeout         time.Duration
+	WatchdogTimeout       time.Duration
+	WatchdogInterval      time.Duration
+	HeartbeatInterval     time.Duration
+	NoOutputWarningAfter  time.Duration
+	TDDMode               bool
+	QualityGateThreshold  int
+	QualityGateTools      []string
+	QCGateTools           []string
+	AllowLowQuality       bool
+	VCS                   contracts.VCS
+	RequireReview         bool
+	MergeOnSuccess        bool
+	CloneManager          CloneManager
+	VCSFactory            VCSFactory
 }
 
 type Loop struct {
 	tasks           contracts.TaskManager
 	runner          contracts.AgentRunner
+	backendRunners  map[string]contracts.AgentRunner
 	events          contracts.EventSink
 	options         LoopOptions
 	taskLock        taskLock
@@ -105,9 +112,18 @@ type taskCompletionChecker interface {
 }
 
 func NewLoop(tasks contracts.TaskManager, runner contracts.AgentRunner, events contracts.EventSink, options LoopOptions) *Loop {
+	backendRunners := map[string]contracts.AgentRunner{}
+	for name, r := range options.BackendRunners {
+		normalized := strings.TrimSpace(strings.ToLower(name))
+		if normalized == "" || r == nil {
+			continue
+		}
+		backendRunners[normalized] = r
+	}
 	return &Loop{
 		tasks:          tasks,
 		runner:         runner,
+		backendRunners: backendRunners,
 		events:         events,
 		options:        options,
 		taskLock:       scheduler.NewTaskLock(),
@@ -438,6 +454,14 @@ func (l *Loop) runTask(ctx context.Context, taskID string, workerID int, queuePo
 	if taskBackend == "" {
 		taskBackend = strings.TrimSpace(l.options.Backend)
 	}
+	implementFallbackBackend := strings.TrimSpace(l.options.FallbackBackend)
+	implementFallbackModel := strings.TrimSpace(l.options.FallbackModel)
+	reviewBackend := strings.TrimSpace(l.options.ReviewBackend)
+	if reviewBackend == "" {
+		reviewBackend = taskBackend
+	}
+	reviewFallbackBackend := strings.TrimSpace(l.options.ReviewFallbackBackend)
+	reviewFallbackModel := strings.TrimSpace(l.options.ReviewFallbackModel)
 	for {
 		reviewFailed := false
 		if err := l.tasks.SetTaskStatus(ctx, task.ID, contracts.TaskStatusInProgress); err != nil {
@@ -466,7 +490,7 @@ func (l *Loop) runTask(ctx context.Context, taskID string, workerID int, queuePo
 			requestMetadata["watchdog_interval"] = l.options.WatchdogInterval.String()
 		}
 
-		result, err := l.runRunnerWithMonitoring(ctx, contracts.RunnerRequest{
+		result, err := l.runRunnerWithFailover(ctx, contracts.RunnerRequest{
 			TaskID:   task.ID,
 			ParentID: l.options.ParentID,
 			Mode:     contracts.RunnerModeImplement,
@@ -482,24 +506,28 @@ func (l *Loop) runTask(ctx context.Context, taskID string, workerID int, queuePo
 				l.options.TDDMode,
 			),
 			Metadata: requestMetadata,
-		}, task.ID, task.Title, worker, taskRepoRoot, queuePos)
+		}, task.ID, task.Title, worker, taskRepoRoot, queuePos, taskBackend, implementFallbackBackend, implementFallbackModel)
 		if err != nil {
 			return summary, err
 		}
 		_ = l.emit(ctx, contracts.Event{Type: contracts.EventTypeRunnerFinished, TaskID: task.ID, TaskTitle: task.Title, WorkerID: worker, ClonePath: taskRepoRoot, QueuePos: queuePos, Message: string(result.Status), Metadata: buildRunnerFinishedMetadata(result), Timestamp: time.Now().UTC()})
 
 		if result.Status == contracts.RunnerResultCompleted && l.options.RequireReview {
+			reviewModel := strings.TrimSpace(l.options.ReviewModel)
+			if reviewModel == "" {
+				reviewModel = implementModel
+			}
 			reviewAttempt := reviewRetries + 1
 			reviewTelemetry := map[string]string{
 				"review_attempt":     fmt.Sprintf("%d", reviewAttempt),
 				"review_retry_count": fmt.Sprintf("%d", reviewRetries),
 			}
 			_ = l.emit(ctx, contracts.Event{Type: contracts.EventTypeReviewStarted, TaskID: task.ID, TaskTitle: task.Title, WorkerID: worker, ClonePath: taskRepoRoot, QueuePos: queuePos, Metadata: reviewTelemetry, Timestamp: time.Now().UTC()})
-			reviewLogPath := defaultRunnerLogPath(taskRepoRoot, task.ID, epicID, taskBackend)
+			reviewLogPath := defaultRunnerLogPath(taskRepoRoot, task.ID, epicID, reviewBackend)
 			if err := ensureRunnerLogDirectory(taskRepoRoot, reviewLogPath); err != nil {
 				return summary, err
 			}
-			reviewStartMeta := buildRunnerStartedMetadata(contracts.RunnerModeReview, taskBackend, implementModel, taskRepoRoot, reviewLogPath, time.Now().UTC())
+			reviewStartMeta := buildRunnerStartedMetadata(contracts.RunnerModeReview, reviewBackend, reviewModel, taskRepoRoot, reviewLogPath, time.Now().UTC())
 			appendTaskRuntimeMetadata(reviewStartMeta, taskRuntime)
 			_ = l.emit(ctx, contracts.Event{Type: contracts.EventTypeRunnerStarted, TaskID: task.ID, TaskTitle: task.Title, WorkerID: worker, ClonePath: taskRepoRoot, QueuePos: queuePos, Message: string(contracts.RunnerModeReview), Metadata: reviewStartMeta, Timestamp: time.Now().UTC()})
 			reviewMetadata := map[string]string{"log_path": reviewLogPath, "clone_path": taskRepoRoot}
@@ -511,16 +539,16 @@ func (l *Loop) runTask(ctx context.Context, taskID string, workerID int, queuePo
 				reviewMetadata["watchdog_interval"] = l.options.WatchdogInterval.String()
 			}
 
-			reviewResult, reviewErr := l.runRunnerWithMonitoring(ctx, contracts.RunnerRequest{
+			reviewResult, reviewErr := l.runRunnerWithFailover(ctx, contracts.RunnerRequest{
 				TaskID:   task.ID,
 				ParentID: l.options.ParentID,
 				Mode:     contracts.RunnerModeReview,
 				RepoRoot: taskRepoRoot,
-				Model:    implementModel,
+				Model:    reviewModel,
 				Timeout:  taskRuntime.timeout,
 				Prompt:   buildPrompt(task, contracts.RunnerModeReview, false),
 				Metadata: reviewMetadata,
-			}, task.ID, task.Title, worker, taskRepoRoot, queuePos)
+			}, task.ID, task.Title, worker, taskRepoRoot, queuePos, reviewBackend, reviewFallbackBackend, reviewFallbackModel)
 			if reviewErr != nil {
 				return summary, reviewErr
 			}
@@ -539,21 +567,21 @@ func (l *Loop) runTask(ctx context.Context, taskID string, workerID int, queuePo
 				if l.options.WatchdogInterval > 0 {
 					verdictMetadata["watchdog_interval"] = l.options.WatchdogInterval.String()
 				}
-				verdictStartMeta := buildRunnerStartedMetadata(contracts.RunnerModeReview, taskBackend, implementModel, taskRepoRoot, reviewLogPath, time.Now().UTC())
+				verdictStartMeta := buildRunnerStartedMetadata(contracts.RunnerModeReview, reviewBackend, reviewModel, taskRepoRoot, reviewLogPath, time.Now().UTC())
 				appendTaskRuntimeMetadata(verdictStartMeta, taskRuntime)
 				verdictStartMeta["review_phase"] = "verdict_retry"
 				_ = l.emit(ctx, contracts.Event{Type: contracts.EventTypeRunnerStarted, TaskID: task.ID, TaskTitle: task.Title, WorkerID: worker, ClonePath: taskRepoRoot, QueuePos: queuePos, Message: string(contracts.RunnerModeReview), Metadata: verdictStartMeta, Timestamp: time.Now().UTC()})
 
-				verdictResult, verdictErr := l.runRunnerWithMonitoring(ctx, contracts.RunnerRequest{
+				verdictResult, verdictErr := l.runRunnerWithFailover(ctx, contracts.RunnerRequest{
 					TaskID:   task.ID,
 					ParentID: l.options.ParentID,
 					Mode:     contracts.RunnerModeReview,
 					RepoRoot: taskRepoRoot,
-					Model:    implementModel,
+					Model:    reviewModel,
 					Timeout:  taskRuntime.timeout,
 					Prompt:   buildReviewVerdictPrompt(task),
 					Metadata: verdictMetadata,
-				}, task.ID, task.Title, worker, taskRepoRoot, queuePos)
+				}, task.ID, task.Title, worker, taskRepoRoot, queuePos, reviewBackend, reviewFallbackBackend, reviewFallbackModel)
 				if verdictErr != nil {
 					return summary, verdictErr
 				}
@@ -1038,7 +1066,66 @@ func (l *Loop) emit(ctx context.Context, event contracts.Event) error {
 	return l.events.Emit(ctx, event)
 }
 
+func (l *Loop) pickRunner(backend string) contracts.AgentRunner {
+	normalized := strings.TrimSpace(strings.ToLower(backend))
+	if normalized != "" {
+		if r, ok := l.backendRunners[normalized]; ok && r != nil {
+			return r
+		}
+	}
+	return l.runner
+}
+
+// runRunnerWithFailover runs `request` against the runner bound to `primaryBackend`
+// and, on a recoverable provider-side failure (transient backend/CLI/API error —
+// NOT a review-content failure), retries the same request once against the runner
+// bound to `fallbackBackend`, substituting `fallbackModel` when non-empty. Emits a
+// `runner_warning` with `backend_switched=<primary>->fallback` so why.sh can trace
+// switches.
+func (l *Loop) runRunnerWithFailover(ctx context.Context, request contracts.RunnerRequest, taskID string, taskTitle string, worker string, clonePath string, queuePos int, primaryBackend string, fallbackBackend string, fallbackModel string) (contracts.RunnerResult, error) {
+	primaryRunner := l.pickRunner(primaryBackend)
+	result, err := l.runWithRunner(ctx, primaryRunner, request, taskID, taskTitle, worker, clonePath, queuePos)
+	if err != nil {
+		return result, err
+	}
+	if !shouldUseBackendFallbackForFailure(result, primaryBackend, fallbackBackend) {
+		return result, nil
+	}
+	fallbackRunner := l.pickRunner(fallbackBackend)
+	if fallbackRunner == nil || fallbackRunner == primaryRunner {
+		return result, nil
+	}
+	switchReason := strings.TrimSpace(result.Reason)
+	_ = l.emit(ctx, contracts.Event{
+		Type:      contracts.EventTypeRunnerWarning,
+		TaskID:    taskID,
+		TaskTitle: taskTitle,
+		WorkerID:  worker,
+		ClonePath: clonePath,
+		QueuePos:  queuePos,
+		Message:   "backend_switched",
+		Metadata: map[string]string{
+			"backend_switched": fmt.Sprintf("%s->%s", strings.TrimSpace(strings.ToLower(primaryBackend)), strings.TrimSpace(strings.ToLower(fallbackBackend))),
+			"backend_previous": strings.TrimSpace(strings.ToLower(primaryBackend)),
+			"backend_fallback": strings.TrimSpace(strings.ToLower(fallbackBackend)),
+			"failover_reason":  switchReason,
+		},
+		Timestamp: time.Now().UTC(),
+	})
+	if strings.TrimSpace(fallbackModel) != "" {
+		request.Model = fallbackModel
+	}
+	return l.runWithRunner(ctx, fallbackRunner, request, taskID, taskTitle, worker, clonePath, queuePos)
+}
+
 func (l *Loop) runRunnerWithMonitoring(ctx context.Context, request contracts.RunnerRequest, taskID string, taskTitle string, worker string, clonePath string, queuePos int) (contracts.RunnerResult, error) {
+	return l.runWithRunner(ctx, l.runner, request, taskID, taskTitle, worker, clonePath, queuePos)
+}
+
+func (l *Loop) runWithRunner(ctx context.Context, runner contracts.AgentRunner, request contracts.RunnerRequest, taskID string, taskTitle string, worker string, clonePath string, queuePos int) (contracts.RunnerResult, error) {
+	if runner == nil {
+		runner = l.runner
+	}
 	heartbeatInterval := l.options.HeartbeatInterval
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = 5 * time.Second
@@ -1121,7 +1208,7 @@ func (l *Loop) runRunnerWithMonitoring(ctx context.Context, request contracts.Ru
 		}
 	}()
 
-	result, err := l.runner.Run(ctx, request)
+	result, err := runner.Run(ctx, request)
 	cancel()
 	return result, err
 }
@@ -1276,9 +1363,23 @@ func buildPrompt(task contracts.Task, mode contracts.RunnerMode, tddMode bool) s
 	if mode == contracts.RunnerModeReview {
 		sections = append(sections, strings.Join([]string{
 			"Review Instructions:",
-			"- Include exactly one verdict line in this format: REVIEW_VERDICT: pass OR REVIEW_VERDICT: fail",
-			"- Use pass only when implementation satisfies acceptance criteria and tests.",
-			"- If fail, include exactly one structured line: REVIEW_FAIL_FEEDBACK: <blocking gaps and required fixes>.",
+			"- Audit the implementation against acceptance criteria, then end your reply with the structured verdict block described below. NO content may follow it.",
+			"- The verdict block is parsed by an exact regex: each marker MUST appear on its own line, at the start of the line (no leading whitespace, no bullet, no quoting).",
+			"- The final marker line MUST be exactly one of:",
+			"    REVIEW_VERDICT: pass",
+			"    REVIEW_VERDICT: fail",
+			"- If verdict is fail, the line immediately BEFORE the verdict MUST be exactly:",
+			"    REVIEW_FAIL_FEEDBACK: <one-line summary of blocking gaps and required fixes>",
+			"- Use pass only when implementation fully satisfies acceptance criteria AND tests pass.",
+			"- Do not include any other line that starts with REVIEW_VERDICT: or REVIEW_FAIL_FEEDBACK: anywhere in your reply.",
+			"- Example of a passing reply tail:",
+			"    ...your analysis...",
+			"    REVIEW_VERDICT: pass",
+			"- Example of a failing reply tail:",
+			"    ...your analysis...",
+			"    REVIEW_FAIL_FEEDBACK: AC #4 not met — /metrics endpoint missing in cmd/foo/main.go",
+			"    REVIEW_VERDICT: fail",
+			"- If you omit the REVIEW_VERDICT line, the orchestrator will treat the run as fail and retry — print the verdict.",
 		}, "\n"))
 	} else {
 		sections = append(sections, strings.Join([]string{
@@ -2455,6 +2556,47 @@ func shouldUseModelFallbackForFailure(result contracts.RunnerResult, currentMode
 	return isRecoverableModelFailureResult(result, currentModel, fallbackModel)
 }
 
+// shouldUseBackendFallbackForFailure reports whether `result` describes a
+// provider-side failure on `primaryBackend` worth retrying on `fallbackBackend`.
+// Review-content failures (verdict=fail, "review rejected", etc.) are explicitly
+// excluded — those are handled by the review retry path, not by switching
+// backends.
+func shouldUseBackendFallbackForFailure(result contracts.RunnerResult, primaryBackend string, fallbackBackend string) bool {
+	if result.Status != contracts.RunnerResultFailed {
+		return false
+	}
+	primary := strings.TrimSpace(strings.ToLower(primaryBackend))
+	fallback := strings.TrimSpace(strings.ToLower(fallbackBackend))
+	if primary == "" || fallback == "" || primary == fallback {
+		return false
+	}
+	return isRecoverableProviderFailureReason(result.Reason)
+}
+
+// isRecoverableProviderFailureReason is the backend-failover counterpart to
+// isRecoverableModelFailureReason. Per the operator decision recorded in
+// feedback_yolo_runner_backend_failover.md, ANY provider-side failure (not just
+// rate limits) on the primary backend triggers a one-shot switch to the
+// fallback backend. Review-content failures are still excluded — those are not
+// the provider's fault.
+func isRecoverableProviderFailureReason(reason string) bool {
+	text := strings.ToLower(strings.TrimSpace(reason))
+	if text == "" {
+		return false
+	}
+	for _, needle := range []string{
+		"review rejected",
+		"review verdict",
+		"review feedback",
+		"failing acceptance criteria",
+	} {
+		if strings.Contains(text, needle) {
+			return false
+		}
+	}
+	return true
+}
+
 func isRecoverableModelFailureReason(reason string) bool {
 	text := strings.ToLower(strings.TrimSpace(reason))
 	if text == "" {
@@ -2529,10 +2671,14 @@ func buildReviewVerdictPrompt(task contracts.Task) string {
 		"Title: " + task.Title,
 		"Verdict-only follow-up:",
 		"- Your previous review did not include the required structured verdict.",
-		"- Respond with exactly one line and no extra text:",
-		"REVIEW_VERDICT: pass",
-		"or",
-		"REVIEW_VERDICT: fail",
+		"- Reply with EXACTLY ONE line, no preamble, no markdown, no trailing text:",
+		"    REVIEW_VERDICT: pass",
+		"  OR",
+		"    REVIEW_VERDICT: fail",
+		"- The marker MUST start at column 0. No bullets, no quoting, no code fence.",
+		"- If verdict is fail, prepend exactly one line (immediately before the verdict):",
+		"    REVIEW_FAIL_FEEDBACK: <one-line summary of blocking gaps>",
+		"- Any reply not matching this contract will be treated as fail.",
 	}
 	return strings.Join(sections, "\n")
 }

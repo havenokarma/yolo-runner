@@ -52,6 +52,12 @@ type runConfig struct {
 	repoRoot                        string
 	rootID                          string
 	backend                         string
+	fallbackBackend                 string
+	fallbackModel                   string
+	reviewBackend                   string
+	reviewModel                     string
+	reviewFallbackBackend           string
+	reviewFallbackModel             string
 	profile                         string
 	trackerType                     string
 	model                           string
@@ -89,6 +95,7 @@ type runConfig struct {
 	distributedRewriteDefaultModel  string
 	distributedRewriteLargerModel   string
 	distributedEventBus             distributed.Bus
+	backendRunners                  map[string]contracts.AgentRunner
 }
 
 var newDistributedBus = func(backend string, address string, opts distributed.BusBackendOptions) (distributed.Bus, error) {
@@ -141,6 +148,12 @@ func RunMain(args []string, run func(context.Context, runConfig) error) int {
 	backend := fs.String("backend", "", "DEPRECATED: use --agent-backend (opencode, codex, codex-cli, claude, kimi, gemini)")
 	agentBackend := fs.String("agent-backend", "", "Runner backend (opencode, codex, codex-cli, claude, kimi, gemini)")
 	model := fs.String("model", "", "Model for CLI agent")
+	fallbackBackend := fs.String("fallback-backend", "", "Backend used when implement phase hits a provider-side error (env: YOLO_FALLBACK_BACKEND)")
+	fallbackModel := fs.String("fallback-model", "", "Model paired with --fallback-backend (env: YOLO_FALLBACK_MODEL)")
+	reviewBackend := fs.String("review-backend", "", "Backend used for the review phase; defaults to --agent-backend (env: YOLO_REVIEW_BACKEND)")
+	reviewModel := fs.String("review-model", "", "Model used for the review phase; defaults to --model (env: YOLO_REVIEW_MODEL)")
+	reviewFallbackBackend := fs.String("review-fallback-backend", "", "Backend used when review phase hits a provider-side error (env: YOLO_REVIEW_FALLBACK_BACKEND)")
+	reviewFallbackModel := fs.String("review-fallback-model", "", "Model paired with --review-fallback-backend (env: YOLO_REVIEW_FALLBACK_MODEL)")
 	profile := fs.String("profile", "", "Tracker profile name from .yolo-runner/config.yaml")
 	qualityThreshold := fs.Int("quality-threshold", 0, "Minimum quality score required to run a task")
 	qualityGateTools := fs.String("quality-gate-tools", "", "Comma-separated quality tools to run in quality gate")
@@ -274,6 +287,35 @@ func RunMain(args []string, run func(context.Context, runConfig) error) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+
+	resolveFlagOrEnv := func(flagValue, envName string) string {
+		if v := strings.TrimSpace(flagValue); v != "" {
+			return v
+		}
+		return strings.TrimSpace(os.Getenv(envName))
+	}
+	normalizeBackendName := func(raw string) string {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return ""
+		}
+		return normalizeBackend(v)
+	}
+	selectedFallbackBackend := normalizeBackendName(resolveFlagOrEnv(*fallbackBackend, "YOLO_FALLBACK_BACKEND"))
+	selectedFallbackModel := resolveFlagOrEnv(*fallbackModel, "YOLO_FALLBACK_MODEL")
+	selectedReviewBackend := normalizeBackendName(resolveFlagOrEnv(*reviewBackend, "YOLO_REVIEW_BACKEND"))
+	selectedReviewModel := resolveFlagOrEnv(*reviewModel, "YOLO_REVIEW_MODEL")
+	selectedReviewFallbackBackend := normalizeBackendName(resolveFlagOrEnv(*reviewFallbackBackend, "YOLO_REVIEW_FALLBACK_BACKEND"))
+	selectedReviewFallbackModel := resolveFlagOrEnv(*reviewFallbackModel, "YOLO_REVIEW_FALLBACK_MODEL")
+	for _, b := range []string{selectedFallbackBackend, selectedReviewBackend, selectedReviewFallbackBackend} {
+		if b == "" {
+			continue
+		}
+		if _, ok := codingAgents.Backend(b); !ok {
+			fmt.Fprintf(os.Stderr, "unknown backend %q in fallback/review configuration; known: %s\n", b, strings.Join(codingAgents.Names(), ", "))
+			return 1
+		}
+	}
 	if selectedConcurrency <= 0 {
 		fmt.Fprintln(os.Stderr, "--concurrency must be greater than 0")
 		return 1
@@ -360,6 +402,12 @@ func RunMain(args []string, run func(context.Context, runConfig) error) int {
 		repoRoot:                        *repo,
 		rootID:                          *root,
 		backend:                         selectedBackend,
+		fallbackBackend:                 selectedFallbackBackend,
+		fallbackModel:                   selectedFallbackModel,
+		reviewBackend:                   selectedReviewBackend,
+		reviewModel:                     selectedReviewModel,
+		reviewFallbackBackend:           selectedReviewFallbackBackend,
+		reviewFallbackModel:             selectedReviewFallbackModel,
 		profile:                         selectedProfile,
 		model:                           selectedModel,
 		maxTasks:                        *max,
@@ -476,6 +524,10 @@ func defaultRun(ctx context.Context, cfg runConfig) error {
 	if err != nil {
 		return err
 	}
+	cfg.backendRunners, err = buildBackendRunners(cfg)
+	if err != nil {
+		return err
+	}
 	runnerAdapter, distributedBus, closeDistributed, err := maybeWrapWithMastermind(ctx, cfg, runnerAdapter, taskStatusBackends)
 	if err != nil {
 		return err
@@ -489,6 +541,33 @@ func defaultRun(ctx context.Context, cfg runConfig) error {
 
 	taskEngine := engine.NewTaskEngine()
 	return runWithStorageComponents(ctx, cfg, storageBackend, taskEngine, runnerAdapter, vcsAdapter)
+}
+
+// buildBackendRunners constructs one AgentRunner per distinct backend referenced
+// by cfg (primary + fallback + review + reviewFallback). The map is keyed by the
+// normalized backend name. Used by runWithComponents/runWithStorageComponents to
+// wire LoopOptions.BackendRunners so that phase-specific failover can pick a
+// runner by backend name without re-building adapters at runtime.
+func buildBackendRunners(cfg runConfig) (map[string]contracts.AgentRunner, error) {
+	wanted := []string{cfg.backend, cfg.fallbackBackend, cfg.reviewBackend, cfg.reviewFallbackBackend}
+	runners := map[string]contracts.AgentRunner{}
+	for _, raw := range wanted {
+		name := normalizeBackend(strings.TrimSpace(raw))
+		if name == "" {
+			continue
+		}
+		if _, exists := runners[name]; exists {
+			continue
+		}
+		local := cfg
+		local.backend = name
+		r, err := buildRunnerAdapter(local)
+		if err != nil {
+			return nil, fmt.Errorf("build runner adapter for backend %q: %w", name, err)
+		}
+		runners[name] = r
+	}
+	return runners, nil
 }
 
 func buildRunnerAdapter(cfg runConfig) (contracts.AgentRunner, error) {
@@ -1165,28 +1244,35 @@ func runWithComponents(ctx context.Context, cfg runConfig, taskManager contracts
 	}
 	vcsFactory := cloneScopedVCSFactory(cfg, vcs)
 	loop := agent.NewLoop(taskManager, runner, eventSink, agent.LoopOptions{
-		ParentID:             cfg.rootID,
-		MaxRetries:           cfg.retryBudget,
-		MaxTasks:             cfg.maxTasks,
-		Concurrency:          cfg.concurrency,
-		QualityGateThreshold: cfg.qualityThreshold,
-		QualityGateTools:     cfg.qualityGateTools,
-		QCGateTools:          cfg.qcGateTools,
-		AllowLowQuality:      cfg.allowLowQuality,
-		SchedulerStatePath:   filepath.Join(cfg.repoRoot, ".yolo-runner", "scheduler-state.json"),
-		DryRun:               cfg.dryRun,
-		RepoRoot:             cfg.repoRoot,
-		Backend:              cfg.backend,
-		Model:                cfg.model,
-		RunnerTimeout:        cfg.runnerTimeout,
-		WatchdogTimeout:      cfg.watchdogTimeout,
-		WatchdogInterval:     cfg.watchdogInterval,
-		TDDMode:              cfg.tddMode,
-		VCS:                  vcs,
-		RequireReview:        true,
-		MergeOnSuccess:       true,
-		CloneManager:         agent.NewGitCloneManager(filepath.Join(cfg.repoRoot, ".yolo-runner", "clones")),
-		VCSFactory:           vcsFactory,
+		ParentID:              cfg.rootID,
+		MaxRetries:            cfg.retryBudget,
+		MaxTasks:              cfg.maxTasks,
+		Concurrency:           cfg.concurrency,
+		QualityGateThreshold:  cfg.qualityThreshold,
+		QualityGateTools:      cfg.qualityGateTools,
+		QCGateTools:           cfg.qcGateTools,
+		AllowLowQuality:       cfg.allowLowQuality,
+		SchedulerStatePath:    filepath.Join(cfg.repoRoot, ".yolo-runner", "scheduler-state.json"),
+		DryRun:                cfg.dryRun,
+		RepoRoot:              cfg.repoRoot,
+		Backend:               cfg.backend,
+		Model:                 cfg.model,
+		FallbackBackend:       cfg.fallbackBackend,
+		FallbackModel:         cfg.fallbackModel,
+		ReviewBackend:         cfg.reviewBackend,
+		ReviewModel:           cfg.reviewModel,
+		ReviewFallbackBackend: cfg.reviewFallbackBackend,
+		ReviewFallbackModel:   cfg.reviewFallbackModel,
+		BackendRunners:        cfg.backendRunners,
+		RunnerTimeout:         cfg.runnerTimeout,
+		WatchdogTimeout:       cfg.watchdogTimeout,
+		WatchdogInterval:      cfg.watchdogInterval,
+		TDDMode:               cfg.tddMode,
+		VCS:                   vcs,
+		RequireReview:         true,
+		MergeOnSuccess:        true,
+		CloneManager:          agent.NewGitCloneManager(filepath.Join(cfg.repoRoot, ".yolo-runner", "clones")),
+		VCSFactory:            vcsFactory,
 	})
 	if eventSink != nil {
 		_ = eventSink.Emit(ctx, contracts.Event{
@@ -1258,28 +1344,35 @@ func runWithStorageComponents(ctx context.Context, cfg runConfig, storage contra
 	}
 	vcsFactory := cloneScopedVCSFactory(cfg, vcs)
 	loop := agent.NewLoopWithTaskEngine(storage, taskEngine, runner, eventSink, agent.LoopOptions{
-		ParentID:             cfg.rootID,
-		MaxRetries:           cfg.retryBudget,
-		MaxTasks:             cfg.maxTasks,
-		Concurrency:          cfg.concurrency,
-		QualityGateThreshold: cfg.qualityThreshold,
-		QualityGateTools:     cfg.qualityGateTools,
-		QCGateTools:          cfg.qcGateTools,
-		AllowLowQuality:      cfg.allowLowQuality,
-		SchedulerStatePath:   filepath.Join(cfg.repoRoot, ".yolo-runner", "scheduler-state.json"),
-		DryRun:               cfg.dryRun,
-		RepoRoot:             cfg.repoRoot,
-		Backend:              cfg.backend,
-		Model:                cfg.model,
-		RunnerTimeout:        cfg.runnerTimeout,
-		WatchdogTimeout:      cfg.watchdogTimeout,
-		WatchdogInterval:     cfg.watchdogInterval,
-		TDDMode:              cfg.tddMode,
-		VCS:                  vcs,
-		RequireReview:        true,
-		MergeOnSuccess:       true,
-		CloneManager:         agent.NewGitCloneManager(filepath.Join(cfg.repoRoot, ".yolo-runner", "clones")),
-		VCSFactory:           vcsFactory,
+		ParentID:              cfg.rootID,
+		MaxRetries:            cfg.retryBudget,
+		MaxTasks:              cfg.maxTasks,
+		Concurrency:           cfg.concurrency,
+		QualityGateThreshold:  cfg.qualityThreshold,
+		QualityGateTools:      cfg.qualityGateTools,
+		QCGateTools:           cfg.qcGateTools,
+		AllowLowQuality:       cfg.allowLowQuality,
+		SchedulerStatePath:    filepath.Join(cfg.repoRoot, ".yolo-runner", "scheduler-state.json"),
+		DryRun:                cfg.dryRun,
+		RepoRoot:              cfg.repoRoot,
+		Backend:               cfg.backend,
+		Model:                 cfg.model,
+		FallbackBackend:       cfg.fallbackBackend,
+		FallbackModel:         cfg.fallbackModel,
+		ReviewBackend:         cfg.reviewBackend,
+		ReviewModel:           cfg.reviewModel,
+		ReviewFallbackBackend: cfg.reviewFallbackBackend,
+		ReviewFallbackModel:   cfg.reviewFallbackModel,
+		BackendRunners:        cfg.backendRunners,
+		RunnerTimeout:         cfg.runnerTimeout,
+		WatchdogTimeout:       cfg.watchdogTimeout,
+		WatchdogInterval:      cfg.watchdogInterval,
+		TDDMode:               cfg.tddMode,
+		VCS:                   vcs,
+		RequireReview:         true,
+		MergeOnSuccess:        true,
+		CloneManager:          agent.NewGitCloneManager(filepath.Join(cfg.repoRoot, ".yolo-runner", "clones")),
+		VCSFactory:            vcsFactory,
 	})
 	if eventSink != nil {
 		_ = eventSink.Emit(ctx, contracts.Event{
