@@ -801,14 +801,52 @@ func structuredReviewFailFeedback(logPath string) (string, bool) {
 	return lastStructuredReviewFailFeedbackLine(string(content))
 }
 
-func lastStructuredVerdictLine(text string) (string, bool) {
+// extractStructuredCandidateLines flattens `text` into individual candidate
+// lines suitable for the REVIEW_VERDICT / REVIEW_FAIL_FEEDBACK regexes.
+//
+// codex-cli writes its log as JSONL: each raw line is a JSON object whose
+// `item.text` field holds the agent's reply with embedded `\n` literals. A
+// naive `strings.Split(content, "\n")` therefore yields a single JSON-shaped
+// line in which the verdict marker (which lives _inside_ the JSON string) is
+// invisible to the anchored regex. For each raw line we attempt to decode JSON
+// and, when the payload looks like a codex `agent_message` item, also emit the
+// embedded text split by newlines so that verdict markers printed by the agent
+// on their own line become matchable.
+func extractStructuredCandidateLines(text string) []string {
 	normalized := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(text)
 	if normalized == "" {
-		return "", false
+		return nil
 	}
+	var out []string
+	for _, raw := range strings.Split(normalized, "\n") {
+		out = append(out, raw)
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || trimmed[0] != '{' {
+			continue
+		}
+		var envelope struct {
+			Item struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"item"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &envelope); err != nil {
+			continue
+		}
+		if envelope.Item.Type != "agent_message" || envelope.Item.Text == "" {
+			continue
+		}
+		for _, inner := range strings.Split(envelope.Item.Text, "\n") {
+			out = append(out, inner)
+		}
+	}
+	return out
+}
+
+func lastStructuredVerdictLine(text string) (string, bool) {
 	lastVerdict := ""
 	found := false
-	for _, line := range strings.Split(normalized, "\n") {
+	for _, line := range extractStructuredCandidateLines(text) {
 		matches := structuredReviewVerdictLinePattern.FindStringSubmatch(line)
 		if len(matches) < 2 {
 			continue
@@ -820,13 +858,9 @@ func lastStructuredVerdictLine(text string) (string, bool) {
 }
 
 func lastStructuredReviewFailFeedbackLine(text string) (string, bool) {
-	normalized := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(text)
-	if normalized == "" {
-		return "", false
-	}
 	lastFeedback := ""
 	found := false
-	for _, line := range strings.Split(normalized, "\n") {
+	for _, line := range extractStructuredCandidateLines(text) {
 		matches := structuredReviewFailFeedbackLinePattern.FindStringSubmatch(line)
 		if len(matches) < 2 {
 			continue
