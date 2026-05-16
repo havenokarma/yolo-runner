@@ -147,7 +147,13 @@ func (a *CLIRunnerAdapter) Run(ctx context.Context, request contracts.RunnerRequ
 	// an explicit Sync the tail of the agent reply can still sit in the kernel
 	// buffer when buildRunnerArtifacts reads the file.
 	_ = stdoutFile.Sync()
+	_ = stderrFile.Sync()
 	ApplyAppServerCompletion(&result, completion)
+	if reason, ok := codexProviderLimitReason(logPath, stderrPath); ok {
+		result.Status = contracts.RunnerResultFailed
+		result.Reason = reason
+		result.ReviewReady = false
+	}
 	hasCompletion := completion != nil
 	hasCompletionVerdict := completion != nil && completion.HasReviewVerdict
 	result.Artifacts = buildRunnerArtifacts(request, result)
@@ -774,6 +780,41 @@ func buildRunnerArtifacts(request contracts.RunnerRequest, result contracts.Runn
 		}
 	}
 	return contracts.BuildRunnerArtifacts("codex", request, result, extras)
+}
+
+func codexProviderLimitReason(paths ...string) (string, bool) {
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if reason, ok := codexProviderLimitTextReason(string(content)); ok {
+			return reason, true
+		}
+	}
+	return "", false
+}
+
+func codexProviderLimitTextReason(text string) (string, bool) {
+	normalized := strings.ToLower(text)
+	needles := []string{
+		"you've hit your usage limit",
+		"you have hit your usage limit",
+		"usage limit",
+		"rate limit exceeded",
+		"too many requests",
+		"quota exceeded",
+		"credit balance is too low",
+	}
+	for _, needle := range needles {
+		if strings.Contains(normalized, needle) {
+			return "codex provider limit: " + needle, true
+		}
+	}
+	return "", false
 }
 
 func hasStructuredPassVerdict(logPath string) bool {

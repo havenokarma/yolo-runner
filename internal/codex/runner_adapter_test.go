@@ -1527,6 +1527,31 @@ func TestCLIRunnerAdapterRunsCodexAndStreamsProgress(t *testing.T) {
 	}
 }
 
+func TestCLIRunnerAdapterMapsCodexUsageLimitTextToProviderFailure(t *testing.T) {
+	adapter := NewCLIRunnerAdapter("codex-bin", commandRunnerFunc(func(_ context.Context, spec CommandSpec) error {
+		_, _ = io.WriteString(spec.Stdout, "{\"type\":\"error\",\"message\":\"You've hit your usage limit. Upgrade to Pro or try again later.\"}\n")
+		return errors.New("exit status 1")
+	}))
+
+	result, err := adapter.Run(context.Background(), contracts.RunnerRequest{
+		TaskID:   "t-codex-limit",
+		RepoRoot: t.TempDir(),
+		Prompt:   "implement",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != contracts.RunnerResultFailed {
+		t.Fatalf("expected failed status, got %q", result.Status)
+	}
+	if !strings.Contains(result.Reason, "codex provider limit") {
+		t.Fatalf("expected codex provider limit reason, got %q", result.Reason)
+	}
+	if strings.Contains(result.Reason, "exit status 1") {
+		t.Fatalf("expected specific provider reason without generic exit status, got %q", result.Reason)
+	}
+}
+
 func TestCLIRunnerAdapterBuildsCommandFromConfiguredArgsTemplate(t *testing.T) {
 	repoRoot := t.TempDir()
 	var gotSpec CommandSpec
