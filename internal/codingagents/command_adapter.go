@@ -2,6 +2,7 @@ package codingagents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -293,6 +294,47 @@ func (a *GenericCLIRunnerAdapter) healthCheck(ctx context.Context) error {
 	return nil
 }
 
+// extractStructuredCandidateLines flattens `text` into individual candidate
+// lines suitable for the REVIEW_VERDICT regex.
+//
+// Some CLI backends (notably codex-cli with --json) write their stdout as
+// JSONL where each line is a JSON object and the agent reply lives inside an
+// `item.text` field with embedded `\n`. A naive strings.Split therefore yields
+// a single JSON-shaped line and the anchored verdict regex never matches. For
+// every raw line we additionally try to decode JSON and, when it looks like an
+// `agent_message` item, emit the inner text split by newline as extra
+// candidates alongside the raw line (so plain-text backends still work).
+func extractStructuredCandidateLines(text string) []string {
+	normalized := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(text)
+	if normalized == "" {
+		return nil
+	}
+	var out []string
+	for _, raw := range strings.Split(normalized, "\n") {
+		out = append(out, raw)
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || trimmed[0] != '{' {
+			continue
+		}
+		var envelope struct {
+			Item struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"item"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &envelope); err != nil {
+			continue
+		}
+		if envelope.Item.Type != "agent_message" || envelope.Item.Text == "" {
+			continue
+		}
+		for _, inner := range strings.Split(envelope.Item.Text, "\n") {
+			out = append(out, inner)
+		}
+	}
+	return out
+}
+
 func structuredReviewVerdict(logPath string) (string, bool) {
 	if strings.TrimSpace(logPath) == "" {
 		return "", false
@@ -301,13 +343,9 @@ func structuredReviewVerdict(logPath string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	normalized := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(string(content))
-	if normalized == "" {
-		return "", false
-	}
 	lastVerdict := ""
 	found := false
-	for _, line := range strings.Split(normalized, "\n") {
+	for _, line := range extractStructuredCandidateLines(string(content)) {
 		matches := structuredReviewVerdictLinePattern.FindStringSubmatch(line)
 		if len(matches) < 2 {
 			continue
