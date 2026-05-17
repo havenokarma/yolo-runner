@@ -67,6 +67,7 @@ type runConfig struct {
 	allowLowQuality                 bool
 	maxTasks                        int
 	retryBudget                     int
+	providerRetryBudget             int
 	concurrency                     int
 	dryRun                          bool
 	mode                            string
@@ -172,6 +173,7 @@ func RunMain(args []string, run func(context.Context, runConfig) error) int {
 	watchdogTimeout := fs.Duration("watchdog-timeout", 10*time.Minute, "No-output watchdog timeout for each runner execution")
 	watchdogInterval := fs.Duration("watchdog-interval", 5*time.Second, "Polling interval used by the no-output watchdog")
 	retryBudget := fs.Int("retry-budget", 5, "Maximum retry attempts per task for remediation loop")
+	providerRetryBudget := fs.Int("provider-retry-budget", 3, "Maximum same-backend retry attempts for transient provider/API/socket errors before backend fallback (env: YOLO_PROVIDER_RETRY_BUDGET)")
 	events := fs.String("events", "", "Path to JSONL events log")
 	role := fs.String("role", "", "Distributed execution role: local, mastermind, executor")
 	distributedBusBackend := fs.String("distributed-bus-backend", "", "Distributed bus backend (redis, nats)")
@@ -258,6 +260,17 @@ func RunMain(args []string, run func(context.Context, runConfig) error) int {
 	selectedRetryBudget := *retryBudget
 	if !flagWasSet("retry-budget") && configDefaults.RetryBudget != nil {
 		selectedRetryBudget = *configDefaults.RetryBudget
+	}
+	selectedProviderRetryBudget := *providerRetryBudget
+	if !flagWasSet("provider-retry-budget") {
+		if raw := strings.TrimSpace(os.Getenv("YOLO_PROVIDER_RETRY_BUDGET")); raw != "" {
+			parsed, parseErr := strconv.Atoi(raw)
+			if parseErr != nil {
+				fmt.Fprintf(os.Stderr, "YOLO_PROVIDER_RETRY_BUDGET must be an integer: %v\n", parseErr)
+				return 1
+			}
+			selectedProviderRetryBudget = parsed
+		}
 	}
 	selectedMode := strings.TrimSpace(configDefaults.Mode)
 	if *mode != "" {
@@ -346,6 +359,10 @@ func RunMain(args []string, run func(context.Context, runConfig) error) int {
 		fmt.Fprintln(os.Stderr, "--retry-budget must be greater than or equal to 0")
 		return 1
 	}
+	if selectedProviderRetryBudget < 0 {
+		fmt.Fprintln(os.Stderr, "--provider-retry-budget must be greater than or equal to 0")
+		return 1
+	}
 	selectedDistributedBusConfig, err := resolveAgentDistributedBusConfig(
 		*repo,
 		*distributedBusBackend,
@@ -412,6 +429,7 @@ func RunMain(args []string, run func(context.Context, runConfig) error) int {
 		model:                           selectedModel,
 		maxTasks:                        *max,
 		retryBudget:                     selectedRetryBudget,
+		providerRetryBudget:             selectedProviderRetryBudget,
 		concurrency:                     selectedConcurrency,
 		dryRun:                          *dryRun,
 		stream:                          selectedStream,
@@ -1259,6 +1277,7 @@ func runWithComponents(ctx context.Context, cfg runConfig, taskManager contracts
 		Model:                 cfg.model,
 		FallbackBackend:       cfg.fallbackBackend,
 		FallbackModel:         cfg.fallbackModel,
+		ProviderRetryBudget:   cfg.providerRetryBudget,
 		ReviewBackend:         cfg.reviewBackend,
 		ReviewModel:           cfg.reviewModel,
 		ReviewFallbackBackend: cfg.reviewFallbackBackend,
@@ -1359,6 +1378,7 @@ func runWithStorageComponents(ctx context.Context, cfg runConfig, storage contra
 		Model:                 cfg.model,
 		FallbackBackend:       cfg.fallbackBackend,
 		FallbackModel:         cfg.fallbackModel,
+		ProviderRetryBudget:   cfg.providerRetryBudget,
 		ReviewBackend:         cfg.reviewBackend,
 		ReviewModel:           cfg.reviewModel,
 		ReviewFallbackBackend: cfg.reviewFallbackBackend,
@@ -1472,6 +1492,7 @@ func buildRunStartedMetadata(cfg runConfig) map[string]string {
 		"tracker":                strings.TrimSpace(cfg.trackerType),
 		"quality_threshold":      strconv.Itoa(cfg.qualityThreshold),
 		"retry_budget":           strconv.Itoa(cfg.retryBudget),
+		"provider_retry_budget":  strconv.Itoa(cfg.providerRetryBudget),
 		"concurrency":            strconv.Itoa(cfg.concurrency),
 		"model":                  cfg.model,
 		"allow_low_quality":      strconv.FormatBool(cfg.allowLowQuality),

@@ -1,5 +1,9 @@
 This project uses a CLI ticket system for task management. Run `tk help` when you need to use it.
 
+## Search
+
+Use the `fff` MCP tools (`fffind`, `ffgrep`, `fff-multi-grep`) for file and content search in this git repo instead of `grep`/`rg`/`find`. Use shell search only when `fff` is unavailable and make that failure explicit.
+
 
 ## Task Management Backends
 

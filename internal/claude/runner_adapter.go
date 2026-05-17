@@ -271,7 +271,6 @@ func claudeProviderLimitReason(paths ...string) (string, bool) {
 			"quota exceeded",
 			"credit balance is too low",
 			`"status":"rate_limited"`,
-			"ratelimittype",
 		} {
 			if strings.Contains(text, needle) {
 				return "claude provider limit: " + needle, true

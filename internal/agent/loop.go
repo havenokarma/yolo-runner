@@ -70,6 +70,7 @@ type LoopOptions struct {
 	Model                 string
 	FallbackBackend       string
 	FallbackModel         string
+	ProviderRetryBudget   int
 	ReviewBackend         string
 	ReviewModel           string
 	ReviewFallbackBackend string
@@ -1079,17 +1080,37 @@ func (l *Loop) pickRunner(backend string) contracts.AgentRunner {
 	return l.runner
 }
 
-// runRunnerWithFailover runs `request` against the runner bound to `primaryBackend`
-// and, on a recoverable provider-side failure (transient backend/CLI/API error —
-// NOT a review-content failure), retries the same request once against the runner
-// bound to `fallbackBackend`, substituting `fallbackModel` when non-empty. Emits a
-// `runner_warning` with `backend_switched=<primary>->fallback` so why.sh can trace
-// switches.
+// runRunnerWithFailover runs `request` against the runner bound to `primaryBackend`.
+// Transient provider/API/socket failures retry the same backend before backend
+// fallback. Hard provider exhaustion still switches directly to fallback.
 func (l *Loop) runRunnerWithFailover(ctx context.Context, request contracts.RunnerRequest, taskID string, taskTitle string, worker string, clonePath string, queuePos int, primaryBackend string, fallbackBackend string, fallbackModel string) (contracts.RunnerResult, error) {
 	primaryRunner := l.pickRunner(primaryBackend)
-	result, err := l.runWithRunner(ctx, primaryRunner, request, taskID, taskTitle, worker, clonePath, queuePos)
-	if err != nil {
-		return result, err
+	result := contracts.RunnerResult{}
+	for attempt := 0; ; attempt++ {
+		var err error
+		result, err = l.runWithRunner(ctx, primaryRunner, request, taskID, taskTitle, worker, clonePath, queuePos)
+		if err != nil {
+			return result, err
+		}
+		if !shouldRetryPrimaryProviderFailure(result, primaryBackend, fallbackBackend, attempt, l.options.ProviderRetryBudget) {
+			break
+		}
+		_ = l.emit(ctx, contracts.Event{
+			Type:      contracts.EventTypeRunnerWarning,
+			TaskID:    taskID,
+			TaskTitle: taskTitle,
+			WorkerID:  worker,
+			ClonePath: clonePath,
+			QueuePos:  queuePos,
+			Message:   "backend_retry",
+			Metadata: map[string]string{
+				"backend_retry":         strings.TrimSpace(strings.ToLower(primaryBackend)),
+				"backend_retry_attempt": strconv.Itoa(attempt + 1),
+				"backend_retry_budget":  strconv.Itoa(l.options.ProviderRetryBudget),
+				"retry_reason":          strings.TrimSpace(result.Reason),
+			},
+			Timestamp: time.Now().UTC(),
+		})
 	}
 	if !shouldUseBackendFallbackForFailure(result, primaryBackend, fallbackBackend) {
 		return result, nil
@@ -2638,6 +2659,24 @@ func shouldUseBackendFallbackForFailure(result contracts.RunnerResult, primaryBa
 	return isRecoverableProviderFailureReason(result.Reason)
 }
 
+func shouldRetryPrimaryProviderFailure(result contracts.RunnerResult, primaryBackend string, fallbackBackend string, attempt int, budget int) bool {
+	if result.Status != contracts.RunnerResultFailed {
+		return false
+	}
+	primary := strings.TrimSpace(strings.ToLower(primaryBackend))
+	fallback := strings.TrimSpace(strings.ToLower(fallbackBackend))
+	if primary == "" || fallback == "" || primary == fallback {
+		return false
+	}
+	if attempt >= budget {
+		return false
+	}
+	if isImmediateBackendFallbackReason(result.Reason) {
+		return false
+	}
+	return isTransientProviderFailureReason(result.Reason)
+}
+
 // isRecoverableProviderFailureReason is the backend-failover counterpart to
 // isRecoverableModelFailureReason. Per the operator decision recorded in
 // feedback_yolo_runner_backend_failover.md, ANY provider-side failure (not just
@@ -2660,6 +2699,58 @@ func isRecoverableProviderFailureReason(reason string) bool {
 		}
 	}
 	return true
+}
+
+func isImmediateBackendFallbackReason(reason string) bool {
+	text := strings.ToLower(strings.TrimSpace(reason))
+	if text == "" {
+		return false
+	}
+	for _, needle := range []string{
+		"you've hit your limit",
+		"provider limit",
+		"usage limit reached",
+		"rate limit exceeded",
+		"too many requests",
+		"quota exceeded",
+		"credit balance is too low",
+		`"status":"rate_limited"`,
+		"429",
+	} {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func isTransientProviderFailureReason(reason string) bool {
+	text := strings.ToLower(strings.TrimSpace(reason))
+	if text == "" || !isRecoverableProviderFailureReason(text) {
+		return false
+	}
+	for _, needle := range []string{
+		"socket connection was closed",
+		"connection reset",
+		"connection refused",
+		"connection aborted",
+		"broken pipe",
+		"unexpected eof",
+		"temporary failure",
+		"temporarily unavailable",
+		"network is unreachable",
+		"i/o timeout",
+		"timeout awaiting",
+		"tls handshake timeout",
+		"stream error",
+		"http2",
+		"api error",
+	} {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func isRecoverableModelFailureReason(reason string) bool {

@@ -125,6 +125,84 @@ func TestLoopRetriesImplementWithBackendFallback(t *testing.T) {
 	}
 }
 
+func TestLoopRetriesTransientProviderFailureBeforeFallback(t *testing.T) {
+	mgr := newFakeTaskManager(contracts.Task{ID: "t-1", Title: "Task 1", Status: contracts.TaskStatusOpen})
+
+	primary := &fakeRunner{results: []contracts.RunnerResult{
+		{Status: contracts.RunnerResultFailed, Reason: "API Error: The socket connection was closed unexpectedly"},
+		{Status: contracts.RunnerResultCompleted},
+	}}
+	fallback := &fakeRunner{results: []contracts.RunnerResult{
+		{Status: contracts.RunnerResultCompleted},
+	}}
+
+	loop := NewLoop(mgr, primary, nil, LoopOptions{
+		ParentID:            "root",
+		Backend:             "claude",
+		Model:               "claude-opus",
+		FallbackBackend:     "codex-cli",
+		FallbackModel:       "gpt-5.3-codex",
+		ProviderRetryBudget: 3,
+		BackendRunners: map[string]contracts.AgentRunner{
+			"claude":    primary,
+			"codex-cli": fallback,
+		},
+	})
+
+	summary, err := loop.Run(context.Background())
+	if err != nil {
+		t.Fatalf("loop failed: %v", err)
+	}
+	if summary.Completed != 1 {
+		t.Fatalf("expected task to complete after same-backend retry, got %#v", summary)
+	}
+	if len(primary.requests) != 2 {
+		t.Fatalf("expected primary backend hit twice, got %d", len(primary.requests))
+	}
+	if len(fallback.requests) != 0 {
+		t.Fatalf("expected fallback backend not to run, got %d requests", len(fallback.requests))
+	}
+}
+
+func TestLoopFallsBackAfterTransientProviderRetryBudget(t *testing.T) {
+	mgr := newFakeTaskManager(contracts.Task{ID: "t-1", Title: "Task 1", Status: contracts.TaskStatusOpen})
+
+	primary := &fakeRunner{results: []contracts.RunnerResult{
+		{Status: contracts.RunnerResultFailed, Reason: "API Error: The socket connection was closed unexpectedly"},
+		{Status: contracts.RunnerResultFailed, Reason: "API Error: The socket connection was closed unexpectedly"},
+	}}
+	fallback := &fakeRunner{results: []contracts.RunnerResult{
+		{Status: contracts.RunnerResultCompleted},
+	}}
+
+	loop := NewLoop(mgr, primary, nil, LoopOptions{
+		ParentID:            "root",
+		Backend:             "claude",
+		Model:               "claude-opus",
+		FallbackBackend:     "codex-cli",
+		FallbackModel:       "gpt-5.3-codex",
+		ProviderRetryBudget: 1,
+		BackendRunners: map[string]contracts.AgentRunner{
+			"claude":    primary,
+			"codex-cli": fallback,
+		},
+	})
+
+	summary, err := loop.Run(context.Background())
+	if err != nil {
+		t.Fatalf("loop failed: %v", err)
+	}
+	if summary.Completed != 1 {
+		t.Fatalf("expected task to complete after backend failover, got %#v", summary)
+	}
+	if len(primary.requests) != 2 {
+		t.Fatalf("expected initial primary run plus one retry, got %d", len(primary.requests))
+	}
+	if len(fallback.requests) != 1 {
+		t.Fatalf("expected fallback backend hit once, got %d", len(fallback.requests))
+	}
+}
+
 func TestLoopReviewUsesDedicatedReviewBackend(t *testing.T) {
 	mgr := newFakeTaskManager(contracts.Task{ID: "t-1", Title: "Task 1", Status: contracts.TaskStatusOpen})
 

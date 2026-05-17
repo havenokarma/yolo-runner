@@ -2162,6 +2162,50 @@ func TestRunMainParsesRetryBudgetFlag(t *testing.T) {
 	}
 }
 
+func TestRunMainParsesProviderRetryBudgetFlag(t *testing.T) {
+	called := false
+	var got runConfig
+	run := func(_ context.Context, cfg runConfig) error {
+		called = true
+		got = cfg
+		return nil
+	}
+
+	code := RunMain([]string{"--repo", "/repo", "--root", "root-1", "--provider-retry-budget", "7"}, run)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+	if !called {
+		t.Fatalf("expected run function to be called")
+	}
+	if got.providerRetryBudget != 7 {
+		t.Fatalf("expected providerRetryBudget=7, got %d", got.providerRetryBudget)
+	}
+}
+
+func TestRunMainParsesProviderRetryBudgetEnv(t *testing.T) {
+	t.Setenv("YOLO_PROVIDER_RETRY_BUDGET", "6")
+
+	called := false
+	var got runConfig
+	run := func(_ context.Context, cfg runConfig) error {
+		called = true
+		got = cfg
+		return nil
+	}
+
+	code := RunMain([]string{"--repo", "/repo", "--root", "root-1"}, run)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d", code)
+	}
+	if !called {
+		t.Fatalf("expected run function to be called")
+	}
+	if got.providerRetryBudget != 6 {
+		t.Fatalf("expected providerRetryBudget=6 from env, got %d", got.providerRetryBudget)
+	}
+}
+
 func TestRunMainUsesDefaultRetryBudget(t *testing.T) {
 	called := false
 	var got runConfig
@@ -2180,6 +2224,9 @@ func TestRunMainUsesDefaultRetryBudget(t *testing.T) {
 	}
 	if got.retryBudget != 5 {
 		t.Fatalf("expected default retryBudget=5, got %d", got.retryBudget)
+	}
+	if got.providerRetryBudget != 3 {
+		t.Fatalf("expected default providerRetryBudget=3, got %d", got.providerRetryBudget)
 	}
 }
 
@@ -2732,6 +2779,21 @@ func TestRunMainRejectsNegativeRetryBudget(t *testing.T) {
 	}
 	if called {
 		t.Fatalf("expected run function not to be called for invalid retry-budget")
+	}
+}
+
+func TestRunMainRejectsNegativeProviderRetryBudget(t *testing.T) {
+	called := false
+	code := RunMain([]string{"--repo", "/repo", "--root", "root-1", "--provider-retry-budget", "-1"}, func(context.Context, runConfig) error {
+		called = true
+		return nil
+	})
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1 when provider-retry-budget is negative, got %d", code)
+	}
+	if called {
+		t.Fatalf("expected run function not to be called for invalid provider-retry-budget")
 	}
 }
 
